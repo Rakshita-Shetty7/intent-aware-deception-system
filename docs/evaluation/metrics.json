@@ -1,0 +1,193 @@
+{
+  "evaluation_timestamp": "2026-08-19T18:21:05.253192+00:00",
+  "software_version": "v1.0-RC",
+  "total_test_cases": 42,
+  "intent_taxonomy": [
+    "RECONNAISSANCE",
+    "DISCOVERY",
+    "CREDENTIAL_ACCESS",
+    "EXECUTION",
+    "PRIVILEGE_ESCALATION",
+    "PERSISTENCE",
+    "EXPLOITATION",
+    "EXFILTRATION",
+    "CLEANUP",
+    "OTHER"
+  ],
+  "gemini_model": "gemini-2.5-flash",
+  "gemini_enabled": true,
+  "intent_classification": {
+    "accuracy": 1.0,
+    "macro_precision": 1.0,
+    "macro_recall": 1.0,
+    "macro_f1": 1.0,
+    "weighted_precision": 1.0,
+    "weighted_recall": 1.0,
+    "weighted_f1": 1.0,
+    "per_class": {
+      "CLEANUP": {
+        "support": 4,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "CREDENTIAL_ACCESS": {
+        "support": 5,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "DISCOVERY": {
+        "support": 5,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "EXECUTION": {
+        "support": 5,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "EXFILTRATION": {
+        "support": 4,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "EXPLOITATION": {
+        "support": 3,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "OTHER": {
+        "support": 4,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "PERSISTENCE": {
+        "support": 4,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "PRIVILEGE_ESCALATION": {
+        "support": 4,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "RECONNAISSANCE": {
+        "support": 4,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      }
+    },
+    "averaging_method": "macro (unweighted across all classes present in ground truth) and weighted (support-weighted)"
+  },
+  "attack_stage_classification": {
+    "accuracy": 1.0,
+    "macro_precision": 1.0,
+    "macro_recall": 1.0,
+    "macro_f1": 1.0,
+    "weighted_precision": 1.0,
+    "weighted_recall": 1.0,
+    "weighted_f1": 1.0,
+    "note": "Stage labels are derived from classification; some stage-intent mappings are inherently correlated."
+  },
+  "risk_statistics": {
+    "total_cases": 42,
+    "min_risk": 0,
+    "max_risk": 35,
+    "avg_risk": 20.83,
+    "severity_distribution": {
+      "MEDIUM": 20,
+      "LOW": 22
+    },
+    "risk_by_intent": {
+      "CREDENTIAL_ACCESS": {
+        "min": 25,
+        "max": 30,
+        "avg": 26.0,
+        "count": 5
+      },
+      "PRIVILEGE_ESCALATION": {
+        "min": 30,
+        "max": 30,
+        "avg": 30.0,
+        "count": 4
+      },
+      "EXECUTION": {
+        "min": 20,
+        "max": 20,
+        "avg": 20.0,
+        "count": 5
+      },
+      "PERSISTENCE": {
+        "min": 30,
+        "max": 30,
+        "avg": 30.0,
+        "count": 4
+      },
+      "EXFILTRATION": {
+        "min": 35,
+        "max": 35,
+        "avg": 35.0,
+        "count": 4
+      },
+      "CLEANUP": {
+        "min": 15,
+        "max": 15,
+        "avg": 15.0,
+        "count": 4
+      },
+      "EXPLOITATION": {
+        "min": 30,
+        "max": 30,
+        "avg": 30.0,
+        "count": 3
+      },
+      "RECONNAISSANCE": {
+        "min": 10,
+        "max": 10,
+        "avg": 10.0,
+        "count": 4
+      },
+      "DISCOVERY": {
+        "min": 15,
+        "max": 15,
+        "avg": 15.0,
+        "count": 5
+      },
+      "OTHER": {
+        "min": 0,
+        "max": 0,
+        "avg": 0.0,
+        "count": 4
+      }
+    },
+    "note": "Risk weights are project-defined constants in risk_engine.py INTENT_BASE_WEIGHTS. They were NOT modified during evaluation."
+  },
+  "hybrid_vs_rule": {
+    "total_cases": 42,
+    "gemini_invoked_count": 0,
+    "gemini_invoked_pct": 0.0,
+    "rule_accuracy": 1.0,
+    "hybrid_accuracy": 1.0,
+    "changed_classifications_count": 0
+  },
+  "changed_classifications": [],
+  "latency_ms": {
+    "rule_avg": 0.0213,
+    "rule_min": 0.0162,
+    "rule_max": 0.0718,
+    "hybrid_avg": 268.9498,
+    "hybrid_min": 178.716,
+    "hybrid_max": 393.2029,
+    "gemini_eval_avg": "N/A (Gemini not invoked)",
+    "gemini_eval_count": 0
+  }
+}
