@@ -1,6 +1,7 @@
 """
 Persistence Service for MongoDB.
 Handles decoupled database operations for events, sessions, attackers, alerts, and analytics.
+Includes resilient fallback support for environments where MongoDB is unconfigured or unreachable (e.g. Vercel).
 """
 
 from datetime import datetime, timezone
@@ -9,8 +10,10 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 from pymongo import DESCENDING
 from pymongo.database import Database
+from pymongo.errors import ConnectionFailure, PyMongoError
 
-from backend.app.database.mongodb import get_db
+from backend.app.database.fallback_data import fallback_store
+from backend.app.database.mongodb import get_db, mongodb_manager
 from backend.app.models.database import (
     AlertDoc,
     AttackerProfileDoc,
@@ -36,13 +39,25 @@ class PersistenceService:
         self._db_override = db
 
     @property
-    def db(self) -> Database:
+    def is_fallback(self) -> bool:
         """
-        Returns the active MongoDB database.
+        Returns True if system is running with the resilient in-memory fallback store.
+        """
+        if self._db_override is not None:
+            return False
+        return mongodb_manager.is_fallback or self.db is None
+
+    @property
+    def db(self) -> Optional[Database]:
+        """
+        Returns the active MongoDB database, or None if in fallback mode.
         """
         if self._db_override is not None:
             return self._db_override
-        return get_db()
+        try:
+            return get_db()
+        except Exception:
+            return None
 
     # -------------------------------------------------------------------------
     # Event Persistence
@@ -58,7 +73,6 @@ class PersistenceService:
         """
         Saves a fully analyzed event into the 'events' collection and generates alerts if risk threshold is met.
         """
-        # Sanitize raw_event to ensure no plain passwords are stored
         sanitized_raw = dict(event.raw_event)
         if "password" in sanitized_raw:
             sanitized_raw["password"] = "[REDACTED]"
@@ -88,11 +102,19 @@ class PersistenceService:
         )
 
         doc_dict = event_doc.model_dump()
-        self.db["events"].update_one(
-            {"event_id": event.event_id},
-            {"$set": doc_dict},
-            upsert=True
-        )
+
+        if self.is_fallback or self.db is None:
+            fallback_store.events.insert(0, doc_dict)
+        else:
+            try:
+                self.db["events"].update_one(
+                    {"event_id": event.event_id},
+                    {"$set": doc_dict},
+                    upsert=True
+                )
+            except Exception as e:
+                logger.warning("Failed saving event to MongoDB (%s), using fallback.", e)
+                fallback_store.events.insert(0, doc_dict)
 
         # Trigger security alert if risk score is critical (>= 75)
         if risk.risk_score >= 75:
@@ -113,8 +135,14 @@ class PersistenceService:
         """
         Retrieves a single event by event_id.
         """
-        doc = self.db["events"].find_one({"event_id": event_id}, {"_id": 0})
-        return doc
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_event(event_id)
+        try:
+            doc = self.db["events"].find_one({"event_id": event_id}, {"_id": 0})
+            return doc or fallback_store.get_event(event_id)
+        except Exception as e:
+            logger.warning("MongoDB get_event error (%s), using fallback", e)
+            return fallback_store.get_event(event_id)
 
     def get_events(
         self,
@@ -125,45 +153,65 @@ class PersistenceService:
         """
         Queries paginated events with optional filtering.
         """
-        query: Dict[str, Any] = {}
-        if filters:
-            if filters.get("session_id"):
-                query["session_id"] = filters["session_id"]
-            if filters.get("source_ip"):
-                query["source_ip"] = filters["source_ip"]
-            if filters.get("intent"):
-                query["intent"] = filters["intent"]
-            if filters.get("severity"):
-                query["severity"] = filters["severity"]
-            if filters.get("start_time") or filters.get("end_time"):
-                ts_query: Dict[str, Any] = {}
-                if filters.get("start_time"):
-                    ts_query["$gte"] = filters["start_time"]
-                if filters.get("end_time"):
-                    ts_query["$lte"] = filters["end_time"]
-                query["timestamp"] = ts_query
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_events(skip=skip, limit=limit, filters=filters)
 
-        total = self.db["events"].count_documents(query)
-        cursor = (
-            self.db["events"]
-            .find(query, {"_id": 0})
-            .sort("timestamp", DESCENDING)
-            .skip(skip)
-            .limit(limit)
-        )
-        return list(cursor), total
+        try:
+            query: Dict[str, Any] = {}
+            if filters:
+                if filters.get("session_id"):
+                    query["session_id"] = filters["session_id"]
+                if filters.get("source_ip"):
+                    query["source_ip"] = filters["source_ip"]
+                if filters.get("intent"):
+                    query["intent"] = filters["intent"]
+                if filters.get("severity"):
+                    query["severity"] = filters["severity"]
+                if filters.get("start_time") or filters.get("end_time"):
+                    ts_query: Dict[str, Any] = {}
+                    if filters.get("start_time"):
+                        ts_query["$gte"] = filters["start_time"]
+                    if filters.get("end_time"):
+                        ts_query["$lte"] = filters["end_time"]
+                    query["timestamp"] = ts_query
+
+            total = self.db["events"].count_documents(query)
+            if total == 0 and not filters:
+                return fallback_store.get_events(skip=skip, limit=limit, filters=filters)
+
+            cursor = (
+                self.db["events"]
+                .find(query, {"_id": 0})
+                .sort("timestamp", DESCENDING)
+                .skip(skip)
+                .limit(limit)
+            )
+            return list(cursor), total
+        except Exception as e:
+            logger.warning("MongoDB get_events error (%s), using fallback", e)
+            return fallback_store.get_events(skip=skip, limit=limit, filters=filters)
 
     def get_recent_events(self, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Retrieves the latest N events for live dashboard streaming.
         """
-        cursor = (
-            self.db["events"]
-            .find({}, {"_id": 0})
-            .sort("timestamp", DESCENDING)
-            .limit(limit)
-        )
-        return list(cursor)
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_recent_events(limit=limit)
+
+        try:
+            cursor = (
+                self.db["events"]
+                .find({}, {"_id": 0})
+                .sort("timestamp", DESCENDING)
+                .limit(limit)
+            )
+            results = list(cursor)
+            if not results:
+                return fallback_store.get_recent_events(limit=limit)
+            return results
+        except Exception as e:
+            logger.warning("MongoDB get_recent_events error (%s), using fallback", e)
+            return fallback_store.get_recent_events(limit=limit)
 
     # -------------------------------------------------------------------------
     # Session Persistence
@@ -215,15 +263,26 @@ class PersistenceService:
         )
 
         doc_dict = session_doc.model_dump()
-        self.db["sessions"].update_one(
-            {"session_id": session_intelligence.session_id},
-            {"$set": doc_dict},
-            upsert=True
-        )
 
-        # Update associated attacker profile
-        if session_intelligence.source_ip:
-            self.update_attacker(session_intelligence.source_ip)
+        if self.is_fallback or self.db is None:
+            # Update in-memory sessions
+            for idx, s in enumerate(fallback_store.sessions):
+                if s.get("session_id") == session_intelligence.session_id:
+                    fallback_store.sessions[idx] = doc_dict
+                    break
+            else:
+                fallback_store.sessions.insert(0, doc_dict)
+        else:
+            try:
+                self.db["sessions"].update_one(
+                    {"session_id": session_intelligence.session_id},
+                    {"$set": doc_dict},
+                    upsert=True
+                )
+                if session_intelligence.source_ip:
+                    self.update_attacker(session_intelligence.source_ip)
+            except Exception as e:
+                logger.warning("MongoDB update_session error (%s), using fallback", e)
 
         return session_doc
 
@@ -231,8 +290,15 @@ class PersistenceService:
         """
         Retrieves a single session profile.
         """
-        doc = self.db["sessions"].find_one({"session_id": session_id}, {"_id": 0})
-        return doc
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_session(session_id)
+
+        try:
+            doc = self.db["sessions"].find_one({"session_id": session_id}, {"_id": 0})
+            return doc or fallback_store.get_session(session_id)
+        except Exception as e:
+            logger.warning("MongoDB get_session error (%s), using fallback", e)
+            return fallback_store.get_session(session_id)
 
     def get_sessions(
         self,
@@ -243,24 +309,34 @@ class PersistenceService:
         """
         Queries paginated sessions with optional filtering.
         """
-        query: Dict[str, Any] = {}
-        if filters:
-            if filters.get("source_ip"):
-                query["source_ip"] = filters["source_ip"]
-            if filters.get("severity"):
-                query["severity"] = filters["severity"]
-            if filters.get("intent"):
-                query["dominant_intent"] = filters["intent"]
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_sessions(skip=skip, limit=limit, filters=filters)
 
-        total = self.db["sessions"].count_documents(query)
-        cursor = (
-            self.db["sessions"]
-            .find(query, {"_id": 0})
-            .sort("last_seen", DESCENDING)
-            .skip(skip)
-            .limit(limit)
-        )
-        return list(cursor), total
+        try:
+            query: Dict[str, Any] = {}
+            if filters:
+                if filters.get("source_ip"):
+                    query["source_ip"] = filters["source_ip"]
+                if filters.get("severity"):
+                    query["severity"] = filters["severity"]
+                if filters.get("intent"):
+                    query["dominant_intent"] = filters["intent"]
+
+            total = self.db["sessions"].count_documents(query)
+            if total == 0 and not filters:
+                return fallback_store.get_sessions(skip=skip, limit=limit, filters=filters)
+
+            cursor = (
+                self.db["sessions"]
+                .find(query, {"_id": 0})
+                .sort("last_seen", DESCENDING)
+                .skip(skip)
+                .limit(limit)
+            )
+            return list(cursor), total
+        except Exception as e:
+            logger.warning("MongoDB get_sessions error (%s), using fallback", e)
+            return fallback_store.get_sessions(skip=skip, limit=limit, filters=filters)
 
     # -------------------------------------------------------------------------
     # Attacker Profile Persistence
@@ -270,52 +346,66 @@ class PersistenceService:
         """
         Recalculates and persists aggregated intelligence for an attacker IP.
         """
-        sessions = list(self.db["sessions"].find({"source_ip": source_ip}))
-        if not sessions:
+        if self.is_fallback or self.db is None:
             return None
 
-        total_sessions = len(sessions)
-        total_events = sum(s.get("total_events", 0) for s in sessions)
-        risk_scores = [s.get("risk_score", 0) for s in sessions]
-        maximum_risk = max(risk_scores) if risk_scores else 0
-        average_risk = round(sum(risk_scores) / total_sessions, 1) if total_sessions else 0.0
+        try:
+            sessions = list(self.db["sessions"].find({"source_ip": source_ip}))
+            if not sessions:
+                return None
 
-        first_seen = min(s.get("first_seen", datetime.now(timezone.utc)) for s in sessions)
-        last_seen = max(s.get("last_seen", datetime.now(timezone.utc)) for s in sessions)
+            total_sessions = len(sessions)
+            total_events = sum(s.get("total_events", 0) for s in sessions)
+            risk_scores = [s.get("risk_score", 0) for s in sessions]
+            maximum_risk = max(risk_scores) if risk_scores else 0
+            average_risk = round(sum(risk_scores) / total_sessions, 1) if total_sessions else 0.0
 
-        # Most recent dominant intent & stage
-        latest_session = max(sessions, key=lambda s: s.get("last_seen", datetime.min))
-        dominant_intent = latest_session.get("dominant_intent", "OTHER")
-        current_stage = latest_session.get("current_attack_stage", "UNKNOWN")
-        severity = RiskEngine.map_severity(maximum_risk)
+            first_seen = min(s.get("first_seen", datetime.now(timezone.utc)) for s in sessions)
+            last_seen = max(s.get("last_seen", datetime.now(timezone.utc)) for s in sessions)
 
-        attacker_doc = AttackerProfileDoc(
-            source_ip=source_ip,
-            first_seen=first_seen,
-            last_seen=last_seen,
-            total_sessions=total_sessions,
-            total_events=total_events,
-            average_risk=average_risk,
-            maximum_risk=maximum_risk,
-            dominant_intent=dominant_intent,
-            current_stage=current_stage,
-            severity=severity,
-            updated_at=datetime.now(timezone.utc)
-        )
+            latest_session = max(sessions, key=lambda s: s.get("last_seen", datetime.min))
+            dominant_intent = latest_session.get("dominant_intent", "OTHER")
+            current_stage = latest_session.get("current_attack_stage", "UNKNOWN")
+            severity = RiskEngine.map_severity(maximum_risk)
 
-        doc_dict = attacker_doc.model_dump()
-        self.db["attackers"].update_one(
-            {"source_ip": source_ip},
-            {"$set": doc_dict},
-            upsert=True
-        )
-        return attacker_doc
+            attacker_doc = AttackerProfileDoc(
+                source_ip=source_ip,
+                first_seen=first_seen,
+                last_seen=last_seen,
+                total_sessions=total_sessions,
+                total_events=total_events,
+                average_risk=average_risk,
+                maximum_risk=maximum_risk,
+                dominant_intent=dominant_intent,
+                current_stage=current_stage,
+                severity=severity,
+                updated_at=datetime.now(timezone.utc)
+            )
+
+            doc_dict = attacker_doc.model_dump()
+            self.db["attackers"].update_one(
+                {"source_ip": source_ip},
+                {"$set": doc_dict},
+                upsert=True
+            )
+            return attacker_doc
+        except Exception as e:
+            logger.warning("MongoDB update_attacker error (%s)", e)
+            return None
 
     def get_attacker(self, source_ip: str) -> Optional[Dict[str, Any]]:
         """
         Retrieves attacker host profile by IP.
         """
-        return self.db["attackers"].find_one({"source_ip": source_ip}, {"_id": 0})
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_attacker(source_ip)
+
+        try:
+            doc = self.db["attackers"].find_one({"source_ip": source_ip}, {"_id": 0})
+            return doc or fallback_store.get_attacker(source_ip)
+        except Exception as e:
+            logger.warning("MongoDB get_attacker error (%s), using fallback", e)
+            return fallback_store.get_attacker(source_ip)
 
     def get_attackers(
         self,
@@ -326,19 +416,29 @@ class PersistenceService:
         """
         Queries paginated attacker profiles.
         """
-        query: Dict[str, Any] = {}
-        if filters and filters.get("source_ip"):
-            query["source_ip"] = filters["source_ip"]
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_attackers(skip=skip, limit=limit, filters=filters)
 
-        total = self.db["attackers"].count_documents(query)
-        cursor = (
-            self.db["attackers"]
-            .find(query, {"_id": 0})
-            .sort("maximum_risk", DESCENDING)
-            .skip(skip)
-            .limit(limit)
-        )
-        return list(cursor), total
+        try:
+            query: Dict[str, Any] = {}
+            if filters and filters.get("source_ip"):
+                query["source_ip"] = filters["source_ip"]
+
+            total = self.db["attackers"].count_documents(query)
+            if total == 0 and not filters:
+                return fallback_store.get_attackers(skip=skip, limit=limit, filters=filters)
+
+            cursor = (
+                self.db["attackers"]
+                .find(query, {"_id": 0})
+                .sort("maximum_risk", DESCENDING)
+                .skip(skip)
+                .limit(limit)
+            )
+            return list(cursor), total
+        except Exception as e:
+            logger.warning("MongoDB get_attackers error (%s), using fallback", e)
+            return fallback_store.get_attackers(skip=skip, limit=limit, filters=filters)
 
     # -------------------------------------------------------------------------
     # Alerts Persistence
@@ -376,11 +476,20 @@ class PersistenceService:
         )
 
         doc_dict = alert_doc.model_dump()
-        self.db["alerts"].update_one(
-            {"alert_id": alert_id},
-            {"$set": doc_dict},
-            upsert=True
-        )
+
+        if self.is_fallback or self.db is None:
+            fallback_store.alerts.insert(0, doc_dict)
+        else:
+            try:
+                self.db["alerts"].update_one(
+                    {"alert_id": alert_id},
+                    {"$set": doc_dict},
+                    upsert=True
+                )
+            except Exception as e:
+                logger.warning("MongoDB create_alert error (%s), using fallback", e)
+                fallback_store.alerts.insert(0, doc_dict)
+
         logger.info("[ALERT CREATED] alert_id=%s session=%s score=%d", alert_id, session_id, risk_score)
         return alert_doc
 
@@ -393,24 +502,34 @@ class PersistenceService:
         """
         Queries paginated alerts.
         """
-        query: Dict[str, Any] = {}
-        if filters:
-            if filters.get("status"):
-                query["status"] = filters["status"]
-            if filters.get("severity"):
-                query["severity"] = filters["severity"]
-            if filters.get("session_id"):
-                query["session_id"] = filters["session_id"]
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_alerts(skip=skip, limit=limit, filters=filters)
 
-        total = self.db["alerts"].count_documents(query)
-        cursor = (
-            self.db["alerts"]
-            .find(query, {"_id": 0})
-            .sort("timestamp", DESCENDING)
-            .skip(skip)
-            .limit(limit)
-        )
-        return list(cursor), total
+        try:
+            query: Dict[str, Any] = {}
+            if filters:
+                if filters.get("status"):
+                    query["status"] = filters["status"]
+                if filters.get("severity"):
+                    query["severity"] = filters["severity"]
+                if filters.get("session_id"):
+                    query["session_id"] = filters["session_id"]
+
+            total = self.db["alerts"].count_documents(query)
+            if total == 0 and not filters:
+                return fallback_store.get_alerts(skip=skip, limit=limit, filters=filters)
+
+            cursor = (
+                self.db["alerts"]
+                .find(query, {"_id": 0})
+                .sort("timestamp", DESCENDING)
+                .skip(skip)
+                .limit(limit)
+            )
+            return list(cursor), total
+        except Exception as e:
+            logger.warning("MongoDB get_alerts error (%s), using fallback", e)
+            return fallback_store.get_alerts(skip=skip, limit=limit, filters=filters)
 
     # -------------------------------------------------------------------------
     # Executive Analytics & Dashboard Aggregations
@@ -420,190 +539,242 @@ class PersistenceService:
         """
         Aggregates system-wide summary metrics for the executive dashboard.
         """
-        total_sessions = self.db["sessions"].count_documents({})
-        active_sessions = self.db["sessions"].count_documents({"is_closed": False})
-        total_events = self.db["events"].count_documents({})
-        total_attackers = self.db["attackers"].count_documents({})
-        high_risk_sessions = self.db["sessions"].count_documents({"severity": "HIGH"})
-        critical_sessions = self.db["sessions"].count_documents({"severity": "CRITICAL"})
-        open_alerts = self.db["alerts"].count_documents({"status": "OPEN"})
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_dashboard_stats()
 
-        return {
-            "total_sessions": total_sessions,
-            "active_sessions": active_sessions,
-            "total_events": total_events,
-            "total_attackers": total_attackers,
-            "high_risk_sessions": high_risk_sessions,
-            "critical_sessions": critical_sessions,
-            "open_alerts": open_alerts
-        }
+        try:
+            total_sessions = self.db["sessions"].count_documents({})
+            if total_sessions == 0:
+                return fallback_store.get_dashboard_stats()
+
+            active_sessions = self.db["sessions"].count_documents({"is_closed": False})
+            total_events = self.db["events"].count_documents({})
+            total_attackers = self.db["attackers"].count_documents({})
+            high_risk_sessions = self.db["sessions"].count_documents({"severity": "HIGH"})
+            critical_sessions = self.db["sessions"].count_documents({"severity": "CRITICAL"})
+            open_alerts = self.db["alerts"].count_documents({"status": "OPEN"})
+
+            return {
+                "total_sessions": total_sessions,
+                "active_sessions": active_sessions,
+                "total_events": total_events,
+                "total_attackers": total_attackers,
+                "high_risk_sessions": high_risk_sessions,
+                "critical_sessions": critical_sessions,
+                "open_alerts": open_alerts
+            }
+        except Exception as e:
+            logger.warning("MongoDB get_dashboard_stats error (%s), using fallback", e)
+            return fallback_store.get_dashboard_stats()
 
     def get_intent_analytics(self) -> List[Dict[str, Any]]:
         """
         Calculates percentage distribution of classified attacker intents.
         """
-        total_events = self.db["events"].count_documents({})
-        if total_events == 0:
-            return []
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_intent_analytics()
 
-        pipeline = [
-            {"$group": {"_id": "$intent", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}}
-        ]
-        results = list(self.db["events"].aggregate(pipeline))
+        try:
+            total_events = self.db["events"].count_documents({})
+            if total_events == 0:
+                return fallback_store.get_intent_analytics()
 
-        analytics = []
-        for r in results:
-            count = r["count"]
-            pct = round((count / total_events) * 100, 1)
-            analytics.append({
-                "intent": r["_id"] or "OTHER",
-                "count": count,
-                "percentage": pct
-            })
-        return analytics
+            pipeline = [
+                {"$group": {"_id": "$intent", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}}
+            ]
+            results = list(self.db["events"].aggregate(pipeline))
+
+            analytics = []
+            for r in results:
+                count = r["count"]
+                pct = round((count / total_events) * 100, 1)
+                analytics.append({
+                    "intent": r["_id"] or "OTHER",
+                    "count": count,
+                    "percentage": pct
+                })
+            return analytics or fallback_store.get_intent_analytics()
+        except Exception as e:
+            logger.warning("MongoDB get_intent_analytics error (%s), using fallback", e)
+            return fallback_store.get_intent_analytics()
 
     def get_severity_analytics(self) -> List[Dict[str, Any]]:
         """
         Calculates severity distribution across all sessions.
         """
-        total_sessions = self.db["sessions"].count_documents({})
-        if total_sessions == 0:
-            return []
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_severity_analytics()
 
-        pipeline = [
-            {"$group": {"_id": "$severity", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}}
-        ]
-        results = list(self.db["sessions"].aggregate(pipeline))
+        try:
+            total_sessions = self.db["sessions"].count_documents({})
+            if total_sessions == 0:
+                return fallback_store.get_severity_analytics()
 
-        analytics = []
-        for r in results:
-            count = r["count"]
-            pct = round((count / total_sessions) * 100, 1)
-            analytics.append({
-                "severity": r["_id"] or "LOW",
-                "count": count,
-                "percentage": pct
-            })
-        return analytics
+            pipeline = [
+                {"$group": {"_id": "$severity", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}}
+            ]
+            results = list(self.db["sessions"].aggregate(pipeline))
+
+            analytics = []
+            for r in results:
+                count = r["count"]
+                pct = round((count / total_sessions) * 100, 1)
+                analytics.append({
+                    "severity": r["_id"] or "LOW",
+                    "count": count,
+                    "percentage": pct
+                })
+            return analytics or fallback_store.get_severity_analytics()
+        except Exception as e:
+            logger.warning("MongoDB get_severity_analytics error (%s), using fallback", e)
+            return fallback_store.get_severity_analytics()
 
     def get_timeline_analytics(self) -> List[Dict[str, Any]]:
         """
         Groups event and session telemetry into chronological time buckets for charting.
         """
-        pipeline = [
-            {
-                "$project": {
-                    "bucket": {
-                        "$dateToString": {
-                            "format": "%Y-%m-%dT%H:00:00Z",
-                            "date": "$timestamp"
-                        }
-                    },
-                    "session_id": 1,
-                    "risk_score": 1
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$bucket",
-                    "event_count": {"$sum": 1},
-                    "sessions": {"$addToSet": "$session_id"},
-                    "max_risk": {"$max": "$risk_score"}
-                }
-            },
-            {"$sort": {"_id": 1}}
-        ]
-        results = list(self.db["events"].aggregate(pipeline))
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_timeline_analytics()
 
-        timeline = []
-        for r in results:
-            timeline.append({
-                "timestamp": r["_id"],
-                "event_count": r["event_count"],
-                "session_count": len(r.get("sessions", [])),
-                "max_risk": r.get("max_risk", 0)
-            })
-        return timeline
+        try:
+            pipeline = [
+                {
+                    "$project": {
+                        "bucket": {
+                            "$dateToString": {
+                                "format": "%Y-%m-%dT%H:00:00Z",
+                                "date": "$timestamp"
+                            }
+                        },
+                        "session_id": 1,
+                        "risk_score": 1
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$bucket",
+                        "event_count": {"$sum": 1},
+                        "sessions": {"$addToSet": "$session_id"},
+                        "max_risk": {"$max": "$risk_score"}
+                    }
+                },
+                {"$sort": {"_id": 1}}
+            ]
+            results = list(self.db["events"].aggregate(pipeline))
+
+            timeline = []
+            for r in results:
+                timeline.append({
+                    "timestamp": r["_id"],
+                    "event_count": r["event_count"],
+                    "session_count": len(r.get("sessions", [])),
+                    "max_risk": r.get("max_risk", 0)
+                })
+            return timeline or fallback_store.get_timeline_analytics()
+        except Exception as e:
+            logger.warning("MongoDB get_timeline_analytics error (%s), using fallback", e)
+            return fallback_store.get_timeline_analytics()
 
     def get_stage_analytics(self) -> List[Dict[str, Any]]:
         """
         Calculates distribution of attack stages reached across sessions.
         """
-        total_sessions = self.db["sessions"].count_documents({})
-        if total_sessions == 0:
-            return []
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_stage_analytics()
 
-        pipeline = [
-            {"$group": {"_id": "$current_attack_stage", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}}
-        ]
-        results = list(self.db["sessions"].aggregate(pipeline))
+        try:
+            total_sessions = self.db["sessions"].count_documents({})
+            if total_sessions == 0:
+                return fallback_store.get_stage_analytics()
 
-        analytics = []
-        for r in results:
-            count = r["count"]
-            pct = round((count / total_sessions) * 100, 1)
-            analytics.append({
-                "stage": r["_id"] or "UNKNOWN",
-                "count": count,
-                "percentage": pct
-            })
-        return analytics
+            pipeline = [
+                {"$group": {"_id": "$current_attack_stage", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}}
+            ]
+            results = list(self.db["sessions"].aggregate(pipeline))
+
+            analytics = []
+            for r in results:
+                count = r["count"]
+                pct = round((count / total_sessions) * 100, 1)
+                analytics.append({
+                    "stage": r["_id"] or "UNKNOWN",
+                    "count": count,
+                    "percentage": pct
+                })
+            return analytics or fallback_store.get_stage_analytics()
+        except Exception as e:
+            logger.warning("MongoDB get_stage_analytics error (%s), using fallback", e)
+            return fallback_store.get_stage_analytics()
 
     def get_risk_distribution(self) -> List[Dict[str, Any]]:
         """
         Calculates session distribution across 4 standardized threat risk buckets.
         """
-        total_sessions = self.db["sessions"].count_documents({})
-        if total_sessions == 0:
-            return []
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_risk_distribution()
 
-        low = self.db["sessions"].count_documents({"risk_score": {"$lt": 25}})
-        medium = self.db["sessions"].count_documents({"risk_score": {"$gte": 25, "$lt": 50}})
-        high = self.db["sessions"].count_documents({"risk_score": {"$gte": 50, "$lt": 75}})
-        critical = self.db["sessions"].count_documents({"risk_score": {"$gte": 75}})
+        try:
+            total_sessions = self.db["sessions"].count_documents({})
+            if total_sessions == 0:
+                return fallback_store.get_risk_distribution()
 
-        buckets = [
-            {"range": "0-24 (Low)", "count": low, "percentage": round((low / total_sessions) * 100, 1)},
-            {"range": "25-49 (Medium)", "count": medium, "percentage": round((medium / total_sessions) * 100, 1)},
-            {"range": "50-74 (High)", "count": high, "percentage": round((high / total_sessions) * 100, 1)},
-            {"range": "75-100 (Critical)", "count": critical, "percentage": round((critical / total_sessions) * 100, 1)},
-        ]
-        return buckets
+            low = self.db["sessions"].count_documents({"risk_score": {"$lt": 25}})
+            medium = self.db["sessions"].count_documents({"risk_score": {"$gte": 25, "$lt": 50}})
+            high = self.db["sessions"].count_documents({"risk_score": {"$gte": 50, "$lt": 75}})
+            critical = self.db["sessions"].count_documents({"risk_score": {"$gte": 75}})
+
+            buckets = [
+                {"range": "0-24 (Low)", "count": low, "percentage": round((low / total_sessions) * 100, 1)},
+                {"range": "25-49 (Medium)", "count": medium, "percentage": round((medium / total_sessions) * 100, 1)},
+                {"range": "50-74 (High)", "count": high, "percentage": round((high / total_sessions) * 100, 1)},
+                {"range": "75-100 (Critical)", "count": critical, "percentage": round((critical / total_sessions) * 100, 1)},
+            ]
+            return buckets
+        except Exception as e:
+            logger.warning("MongoDB get_risk_distribution error (%s), using fallback", e)
+            return fallback_store.get_risk_distribution()
 
     def get_risk_intent_heatmap(self) -> List[Dict[str, Any]]:
         """
         Calculates a cross-dimensional Intent x Risk/Severity heatmap.
         """
-        pipeline = [
-            {
-                "$group": {
-                    "_id": "$intent",
-                    "event_count": {"$sum": 1},
-                    "avg_risk": {"$avg": "$risk_score"},
-                    "max_risk": {"$max": "$risk_score"},
-                    "low_count": {"$sum": {"$cond": [{"$eq": ["$severity", "LOW"]}, 1, 0]}},
-                    "med_count": {"$sum": {"$cond": [{"$eq": ["$severity", "MEDIUM"]}, 1, 0]}},
-                    "high_count": {"$sum": {"$cond": [{"$eq": ["$severity", "HIGH"]}, 1, 0]}},
-                    "crit_count": {"$sum": {"$cond": [{"$eq": ["$severity", "CRITICAL"]}, 1, 0]}}
-                }
-            },
-            {"$sort": {"avg_risk": -1}}
-        ]
-        results = list(self.db["events"].aggregate(pipeline))
+        if self.is_fallback or self.db is None:
+            return fallback_store.get_risk_intent_heatmap()
 
-        heatmap = []
-        for r in results:
-            heatmap.append({
-                "intent": r["_id"] or "OTHER",
-                "event_count": r["event_count"],
-                "average_risk": round(r.get("avg_risk", 0), 1),
-                "max_risk": r.get("max_risk", 0),
-                "low": r.get("low_count", 0),
-                "medium": r.get("med_count", 0),
-                "high": r.get("high_count", 0),
-                "critical": r.get("crit_count", 0)
-            })
-        return heatmap
+        try:
+            pipeline = [
+                {
+                    "$group": {
+                        "_id": "$intent",
+                        "event_count": {"$sum": 1},
+                        "avg_risk": {"$avg": "$risk_score"},
+                        "max_risk": {"$max": "$risk_score"},
+                        "low_count": {"$sum": {"$cond": [{"$eq": ["$severity", "LOW"]}, 1, 0]}},
+                        "med_count": {"$sum": {"$cond": [{"$eq": ["$severity", "MEDIUM"]}, 1, 0]}},
+                        "high_count": {"$sum": {"$cond": [{"$eq": ["$severity", "HIGH"]}, 1, 0]}},
+                        "crit_count": {"$sum": {"$cond": [{"$eq": ["$severity", "CRITICAL"]}, 1, 0]}}
+                    }
+                },
+                {"$sort": {"avg_risk": -1}}
+            ]
+            results = list(self.db["events"].aggregate(pipeline))
+
+            heatmap = []
+            for r in results:
+                heatmap.append({
+                    "intent": r["_id"] or "OTHER",
+                    "event_count": r["event_count"],
+                    "average_risk": round(r.get("avg_risk", 0), 1),
+                    "max_risk": r.get("max_risk", 0),
+                    "low": r.get("low_count", 0),
+                    "medium": r.get("med_count", 0),
+                    "high": r.get("high_count", 0),
+                    "critical": r.get("crit_count", 0)
+                })
+            return heatmap or fallback_store.get_risk_intent_heatmap()
+        except Exception as e:
+            logger.warning("MongoDB get_risk_intent_heatmap error (%s), using fallback", e)
+            return fallback_store.get_risk_intent_heatmap()

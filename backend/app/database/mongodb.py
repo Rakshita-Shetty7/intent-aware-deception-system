@@ -24,39 +24,52 @@ class MongoDBManager:
         self.database_name = database_name or settings.DATABASE_NAME
         self._client: Optional[MongoClient] = None
         self._db: Optional[Database] = None
+        self._is_fallback: bool = False
 
-    def connect(self) -> Database:
+    @property
+    def is_fallback(self) -> bool:
+        return self._is_fallback
+
+    def connect(self) -> Optional[Database]:
         """
         Establishes connection to MongoDB and creates necessary indexes.
+        If connection cannot be established (e.g. in serverless cloud environments),
+        gracefully switches to fallback mode without crashing.
         """
-        if self._db is not None:
+        if self._db is not None and not self._is_fallback:
             return self._db
 
         try:
             logger.info("Connecting to MongoDB database: '%s'...", self.database_name)
             self._client = MongoClient(
                 self.uri,
-                serverSelectionTimeoutMS=3000,
-                connectTimeoutMS=3000
+                serverSelectionTimeoutMS=2000,
+                connectTimeoutMS=2000
             )
             # Verify connectivity
             self._client.admin.command("ping")
             self._db = self._client[self.database_name]
+            self._is_fallback = False
             logger.info("Successfully connected to MongoDB.")
 
             self.create_indexes()
             return self._db
 
-        except (ConnectionFailure, PyMongoError) as e:
-            logger.error("Failed to connect to MongoDB: %s", e)
+        except Exception as e:
+            logger.warning(
+                "MongoDB connection to '%s' failed (%s). Switching to resilient in-memory fallback store.",
+                self.uri,
+                e
+            )
             self._db = None
-            raise
+            self._is_fallback = True
+            return None
 
-    def get_database(self) -> Database:
+    def get_database(self) -> Optional[Database]:
         """
         Retrieves the active database instance, connecting if necessary.
         """
-        if self._db is None:
+        if self._db is None and not self._is_fallback:
             return self.connect()
         return self._db
 
@@ -64,17 +77,24 @@ class MongoDBManager:
         """
         Performs a ping command to verify database health.
         """
+        if self._is_fallback:
+            return False
+
         if self._client is None:
             try:
                 self.connect()
             except Exception:
                 return False
 
+        if self._client is None or self._is_fallback:
+            return False
+
         try:
             self._client.admin.command("ping")
             return True
         except Exception as e:
             logger.warning("MongoDB health check failed: %s", e)
+            self._is_fallback = True
             return False
 
     def create_indexes(self) -> None:

@@ -60,13 +60,13 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
-# Configure CORS Middleware (Restricted to configured frontend origins)
+# Configure CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origins=["*"],
+    allow_origin_regex=r"^https?://.*$",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"]
 )
 
@@ -83,6 +83,7 @@ app.include_router(analytics_router, prefix="/api")
 app.include_router(websocket_router)
 
 
+@app.get("/api", include_in_schema=False)
 @app.get("/", include_in_schema=False)
 def root():
     return {

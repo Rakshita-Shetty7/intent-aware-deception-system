@@ -15,7 +15,17 @@ def health_check():
     Checks the status of the FastAPI backend and MongoDB database connection.
     """
     is_db_connected = mongodb_manager.check_health()
+    if is_db_connected:
+        db_status = "connected"
+        overall_status = "healthy"
+    elif mongodb_manager.is_fallback:
+        db_status = "in_memory_fallback"
+        overall_status = "healthy"
+    else:
+        db_status = "disconnected"
+        overall_status = "degraded"
+
     return HealthResponse(
-        status="healthy" if is_db_connected else "degraded",
-        database="connected" if is_db_connected else "disconnected"
+        status=overall_status,
+        database=db_status
     )

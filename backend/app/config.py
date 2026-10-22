@@ -42,7 +42,10 @@ class Settings:
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
 
     # CORS Allowed Origins
-    CORS_ORIGINS_RAW: str = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000")
+    CORS_ORIGINS_RAW: str = os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000,https://int-aware.vercel.app"
+    )
     
     @property
     def CORS_ORIGINS(self) -> List[str]:
